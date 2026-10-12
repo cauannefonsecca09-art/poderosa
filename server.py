@@ -100,7 +100,7 @@ USANDO_TURSO = bool(TURSO_URL and TURSO_TOKEN and TURSO_BIBLIOTECA_OK)
 
 
 # ============================================================
-# Wrappers para o libsql se comportar como sqlite3
+# Wrappers do libsql (compatibilidade com sqlite3.Row)
 # ============================================================
 class _RowLibsql:
     """Linha que aceita row['coluna'], row[0], dict e tupla."""
@@ -158,6 +158,8 @@ class _CursorLibsql:
     def __init__(self, cur):
         self._cur = cur
         self._cols = None
+        self.lastrowid = None
+        self.rowcount = 0
     def _atualiza_cols(self):
         try:
             desc = getattr(self._cur, "description", None)
@@ -165,6 +167,14 @@ class _CursorLibsql:
                 self._cols = [d[0] for d in desc]
         except Exception:
             self._cols = None
+        try:
+            self.lastrowid = getattr(self._cur, "lastrowid", None)
+        except Exception:
+            self.lastrowid = None
+        try:
+            self.rowcount = getattr(self._cur, "rowcount", 0) or 0
+        except Exception:
+            self.rowcount = 0
     def execute(self, *a, **k):
         r = self._cur.execute(*a, **k)
         self._atualiza_cols()
@@ -540,6 +550,12 @@ def usuario_publico(u):
 
 
 def criar_sessao(c, uid):
+    if uid is None:
+        raise ApiErro("Erro interno: usuário sem ID.", 500)
+    try:
+        uid = int(uid)
+    except (TypeError, ValueError):
+        raise ApiErro("Erro interno: ID inválido.", 500)
     token = secrets.token_urlsafe(32)
     exp = (datetime.now() + timedelta(days=SESSAO_DIAS)).strftime("%Y-%m-%d %H:%M:%S")
     c.execute("INSERT INTO sessoes(token,usuario_id,expira_em) VALUES(?,?,?)", (token, uid, exp))
@@ -719,8 +735,15 @@ def exigir_admin(h):
 
 def _rotas(c, h, metodo, rota, partes, corpo, token):
     if rota == "saude" and metodo == "GET":
-        return 200, {"ok": True, "hora": agora(), "frete_real": bool(TOKEN_ME),
-                     "banco": "turso" if USANDO_TURSO else "sqlite_local"}
+        info = {"ok": True, "hora": agora(), "frete_real": bool(TOKEN_ME),
+                "banco": "turso" if USANDO_TURSO else "sqlite_local",
+                "turso_url": TURSO_URL or "", "libsql_ok": TURSO_BIBLIOTECA_OK}
+        try:
+            tabelas = c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            info["tabelas"] = [t[0] for t in tabelas]
+        except Exception as e:
+            info["tabelas_erro"] = repr(e)
+        return 200, info
 
     if rota == "frete" and metodo == "POST":
         cep = corpo.get("cep") or ""
@@ -744,10 +767,17 @@ def _rotas(c, h, metodo, rota, partes, corpo, token):
         if c.execute("SELECT 1 FROM usuarios WHERE email=?", (email,)).fetchone():
             raise ApiErro("E-mail já cadastrado.", 409)
         salt, h_ = hash_senha(senha)
-        cur = c.execute("INSERT INTO usuarios(nome,email,salt,senha_hash,criado_em) VALUES(?,?,?,?,?)",
-                        (nome, email, salt, h_, agora()))
-        tk = criar_sessao(c, cur.lastrowid)
-        u = c.execute("SELECT * FROM usuarios WHERE id=?", (cur.lastrowid,)).fetchone()
+        c.execute("INSERT INTO usuarios(nome,email,salt,senha_hash,criado_em) VALUES(?,?,?,?,?)",
+                  (nome, email, salt, h_, agora()))
+        # Busca o usuário pelo e-mail (mais confiável que lastrowid no libsql)
+        u = c.execute("SELECT * FROM usuarios WHERE email=?", (email,)).fetchone()
+        if not u:
+            raise ApiErro("Erro ao criar conta. Tente novamente.", 500)
+        try:
+            uid = u["id"]
+        except Exception:
+            uid = u[0]
+        tk = criar_sessao(c, uid)
         return 201, {"token": tk, "usuario": usuario_publico(u)}
 
     if rota == "login" and metodo == "POST":
@@ -937,21 +967,29 @@ def _rotas(c, h, metodo, rota, partes, corpo, token):
                 if not c.execute("SELECT 1 FROM pedidos WHERE codigo=?", (cand,)).fetchone():
                     codigo = cand
                     break
-            cur = c.execute(
+            c.execute(
                 "INSERT INTO pedidos(codigo,usuario_id,subtotal,frete,frete_nome,desconto_pix,desconto_cupom,cupom,"
                 "total,pagamento,cep,rua,numero,complemento,cidade,estado,criado_em,custo_frete_loja) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (codigo, u["id"], subtotal, frete_valor, frete_nome, pix, desc_cupom,
                  cupom_cod, total, pag, "%s-%s" % (cep[:5], cep[5:]), rua, numero, comp,
                  cidade, estado, agora(), custo_loja))
-            pid = cur.lastrowid
-            for it in lista:
-                c.execute("INSERT INTO pedido_itens VALUES(?,?,?,?,?)",
-                          (pid, it["id"], it["nome"], it["preco"], it["quantidade"]))
-                c.execute("UPDATE produtos SET estoque=estoque-? WHERE id=?",
-                          (it["quantidade"], it["id"]))
+            p = c.execute("SELECT * FROM pedidos WHERE codigo=?", (codigo,)).fetchone()
+            if p:
+                try:
+                    pid = p["id"]
+                except Exception:
+                    pid = p[0]
+            else:
+                pid = None
+            if pid:
+                for it in lista:
+                    c.execute("INSERT INTO pedido_itens VALUES(?,?,?,?,?)",
+                              (pid, it["id"], it["nome"], it["preco"], it["quantidade"]))
+                    c.execute("UPDATE produtos SET estoque=estoque-? WHERE id=?",
+                              (it["quantidade"], it["id"]))
             c.execute("DELETE FROM carrinho WHERE usuario_id=?", (u["id"],))
-            p = c.execute("SELECT * FROM pedidos WHERE id=?", (pid,)).fetchone()
+            p = c.execute("SELECT * FROM pedidos WHERE codigo=?", (codigo,)).fetchone()
             return 201, {"pedido": pedido_json(c, p)}
 
     if rota == "avaliacoes" and len(partes) > 1 and partes[1].isdigit():
@@ -1014,10 +1052,7 @@ def _rotas(c, h, metodo, rota, partes, corpo, token):
                 novo = max(0, int(corpo.get("estoque", 0)))
             except (TypeError, ValueError):
                 raise ApiErro("Estoque inválido.")
-            n = c.execute("UPDATE produtos SET estoque=? WHERE id=?",
-                          (novo, int(partes[2]))).rowcount
-            if not n:
-                raise ApiErro("Produto não encontrado.", 404)
+            c.execute("UPDATE produtos SET estoque=? WHERE id=?", (novo, int(partes[2])))
             return 200, {"ok": True}
         if sub == "cupons" and metodo == "GET":
             rows = c.execute("SELECT * FROM cupons").fetchall()
@@ -1086,7 +1121,7 @@ def avisar_logos_faltando():
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "PoderosaServer/4.0"
+    server_version = "PoderosaServer/5.0"
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[%s] %s\n" % (datetime.now().strftime("%H:%M:%S"), fmt % args))
@@ -1207,14 +1242,13 @@ def main():
     print(" Abra:  http://localhost:%d" % PORT)
     if USANDO_TURSO:
         print(" Banco: TURSO (nuvem) -> %s" % TURSO_URL)
-        print("        Dados salvos na nuvem, nunca perde.")
     else:
         print(" Banco: SQLite local -> %s" % DB_PATH)
     print(" CEP de origem (frete): %s" % CEP_ORIGEM)
     if TOKEN_ME:
         print(" Melhor Envio: TOKEN CARREGADO (frete REAL ativo)")
     else:
-        print(" Melhor Envio: token nao encontrado em token_melhorenvio.txt")
+        print(" Melhor Envio: token nao encontrado")
     print(" Admin token: %s" % ADMIN_TOKEN)
     print("=" * 60)
     try:
