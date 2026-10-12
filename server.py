@@ -2,20 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 Servidor da loja PODEROSA — com banco de dados na NUVEM (Turso)
-
-Como usar:
-    1) Coloque este server.py na MESMA pasta do index.html
-       (fotos em static/images/)
-    2) Tenha os arquivos:
-       - token_melhorenvio.txt  (frete real)
-       - token_turso.txt        (banco de dados na nuvem)
-    3) pip install libsql
-    4) python server.py
-    5) Abra http://localhost:8000
-
-Banco de dados:
-    - Com Turso configurado: TUDO fica salvo na nuvem (não perde nunca)
-    - Sem Turso: usa SQLite local (pow.db) como fallback
 """
 import hashlib
 import hmac
@@ -34,7 +20,6 @@ from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, unquote
 
-# ---- Turso (SQLite na nuvem) ----
 try:
     import libsql
     TURSO_BIBLIOTECA_OK = True
@@ -54,7 +39,6 @@ ADMIN_FILE = os.path.join(BASE_DIR, ".admin_token")
 TOKEN_ME_FILE = os.path.join(BASE_DIR, "token_melhorenvio.txt")
 TOKEN_TURSO_FILE = os.path.join(BASE_DIR, "token_turso.txt")
 
-# ---- Melhor Envio ----
 CEP_ORIGEM = os.environ.get("CEP_ORIGEM", "41925-715")
 MELHOR_ENVIO_API = os.environ.get("MELHOR_ENVIO_API",
                              "https://melhorenvio.com.br/api/v2/me/shipment/calculate")
@@ -97,7 +81,6 @@ TOKEN_ME = ler_token_me()
 
 
 def ler_token_turso():
-    """Lê 'URL: ...' e 'TOKEN: ...' do arquivo token_turso.txt."""
     if not os.path.exists(TOKEN_TURSO_FILE):
         return None, None
     url, tok = None, None
@@ -117,42 +100,61 @@ USANDO_TURSO = bool(TURSO_URL and TURSO_TOKEN and TURSO_BIBLIOTECA_OK)
 
 
 # ============================================================
-# Wrappers para o libsql se comportar como sqlite3 (row['coluna'])
+# Wrappers para o libsql se comportar como sqlite3
 # ============================================================
 class _RowLibsql:
-    """Linha que aceita tanto row['coluna'] quanto row[0]."""
-    __slots__ = ("_cols", "_vals")
-    def __init__(self, colunas, valores):
-        self._cols = colunas
-        self._vals = valores
+    """Linha que aceita row['coluna'], row[0], dict e tupla."""
+    __slots__ = ("_cols", "_vals", "_dict")
+    def __init__(self, colunas, valores=None):
+        if valores is None and isinstance(colunas, dict):
+            self._dict = dict(colunas)
+            self._cols = tuple(colunas.keys())
+            self._vals = tuple(colunas.values())
+            return
+        self._cols = tuple(colunas or ())
+        self._vals = tuple(valores or ())
+        try:
+            self._dict = dict(zip(self._cols, self._vals))
+        except Exception:
+            self._dict = {}
     def __getitem__(self, k):
         if isinstance(k, str):
+            if k in self._dict:
+                return self._dict[k]
             return self._vals[self._cols.index(k)]
         return self._vals[k]
     def __iter__(self):
         return iter(self._vals)
     def __len__(self):
         return len(self._vals)
+    def __contains__(self, k):
+        if isinstance(k, str):
+            return k in self._dict or k in self._cols
+        return k in self._vals
     def keys(self):
         return list(self._cols)
+    def values(self):
+        return list(self._vals)
+    def items(self):
+        return list(zip(self._cols, self._vals))
     def get(self, k, default=None):
         try:
             return self[k]
         except Exception:
             return default
-    def __contains__(self, k):
-        if isinstance(k, str):
-            return k in self._cols
-        return False
+    def __eq__(self, other):
+        if isinstance(other, _RowLibsql):
+            return self._dict == other._dict
+        if isinstance(other, dict):
+            return self._dict == other
+        if isinstance(other, (tuple, list)):
+            return self._vals == tuple(other)
+        return NotImplemented
     def __repr__(self):
-        try:
-            return "Row(%r)" % (dict(zip(self._cols, self._vals)),)
-        except Exception:
-            return "Row(%r)" % (self._vals,)
+        return "Row(%r)" % (self._dict,)
 
 
 class _CursorLibsql:
-    """Envolve o cursor do libsql para devolver _RowLibsql."""
     def __init__(self, cur):
         self._cur = cur
         self._cols = None
@@ -177,12 +179,20 @@ class _CursorLibsql:
     def _wrap(self, linha):
         if linha is None:
             return None
+        if isinstance(linha, _RowLibsql):
+            return linha
+        if isinstance(linha, dict):
+            return _RowLibsql(linha)
+        try:
+            if hasattr(linha, "keys"):
+                d = {k: linha[k] for k in linha.keys()}
+                return _RowLibsql(d)
+        except Exception:
+            pass
         if self._cols is None:
             self._atualiza_cols()
         try:
-            if self._cols and not isinstance(linha, _RowLibsql):
-                if hasattr(linha, "keys"):
-                    return _RowLibsql(list(linha.keys()), tuple(linha[k] for k in linha.keys()))
+            if self._cols:
                 return _RowLibsql(self._cols, tuple(linha))
         except Exception:
             pass
@@ -212,7 +222,6 @@ class _CursorLibsql:
 
 
 class _ConnLibsql:
-    """Envolve a conexão do libsql para retornar _CursorLibsql."""
     def __init__(self, conn):
         self._conn = conn
     def execute(self, *a, **k):
@@ -247,9 +256,8 @@ class _ConnLibsql:
             self.close()
         except Exception:
             pass
-
-
 # ============================================================
+
 
 def agora():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -270,7 +278,6 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def _colunas_tabela(c, tabela):
-    """Compatível com sqlite3 E libsql."""
     try:
         cur = c.execute("PRAGMA table_info(%s)" % tabela)
     except Exception:
@@ -303,7 +310,6 @@ def _colunas_tabela(c, tabela):
 
 
 def conectar():
-    """Turso se disponível; senão SQLite local."""
     if USANDO_TURSO:
         base = libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
         try:
@@ -331,10 +337,8 @@ def calcular_frete_me(cep_destino, itens, subtotal):
     cep_orig = re.sub(r"\D", "", CEP_ORIGEM or "")
     if len(cep_dest) == 8 and eh_salvador(cep_dest):
         return [{
-            "chave": "salvador",
-            "nome": "Entrega em Salvador",
-            "valor": moeda(FRETE_SALVADOR_VALOR),
-            "prazo": FRETE_SALVADOR_PRAZO,
+            "chave": "salvador", "nome": "Entrega em Salvador",
+            "valor": moeda(FRETE_SALVADOR_VALOR), "prazo": FRETE_SALVADOR_PRAZO,
             "empresa": "Poderosa",
         }]
     if len(cep_dest) != 8 or len(cep_orig) != 8 or not TOKEN_ME:
@@ -348,13 +352,9 @@ def calcular_frete_me(cep_destino, itens, subtotal):
         e = EMBALAGENS[tipo]
         for _ in range(qtd):
             produtos_env.append({
-                "id": str(pid),
-                "width": e["largura"],
-                "height": e["altura"],
-                "length": e["comprimento"],
-                "weight": e["peso"],
-                "insurance_value": 0,
-                "quantity": 1,
+                "id": str(pid), "width": e["largura"], "height": e["altura"],
+                "length": e["comprimento"], "weight": e["peso"],
+                "insurance_value": 0, "quantity": 1,
             })
 
     payload = json.dumps({
@@ -400,10 +400,8 @@ def calcular_frete_me(cep_destino, itens, subtotal):
         empresa = (d.get("company") or {}).get("name", "")
         label = nome if nome.lower().startswith(empresa.lower()) else (empresa + " " + nome).strip()
         chave = re.sub(r"[^a-z0-9]+", "-", nome.lower())[:30]
-        opcoes.append({
-            "chave": chave, "nome": label, "valor": moeda(preco),
-            "prazo": prazo, "empresa": empresa,
-        })
+        opcoes.append({"chave": chave, "nome": label, "valor": moeda(preco),
+                       "prazo": prazo, "empresa": empresa})
 
     if subtotal >= FRETE_GRATIS_MINIMO and opcoes:
         mais_barato = min(opcoes, key=lambda o: o["valor"])
@@ -424,67 +422,44 @@ def criar_banco():
         c.executescript("""
             CREATE TABLE IF NOT EXISTS usuarios(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nome TEXT NOT NULL,
-                email TEXT NOT NULL UNIQUE,
-                salt TEXT NOT NULL,
-                senha_hash TEXT NOT NULL,
-                criado_em TEXT NOT NULL
+                nome TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
+                salt TEXT NOT NULL, senha_hash TEXT NOT NULL, criado_em TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS sessoes(
-                token TEXT PRIMARY KEY,
-                usuario_id INTEGER NOT NULL,
-                expira_em TEXT NOT NULL
+                token TEXT PRIMARY KEY, usuario_id INTEGER NOT NULL, expira_em TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS favoritos(
-                usuario_id INTEGER NOT NULL,
-                produto_id INTEGER NOT NULL,
+                usuario_id INTEGER NOT NULL, produto_id INTEGER NOT NULL,
                 PRIMARY KEY(usuario_id, produto_id)
             );
             CREATE TABLE IF NOT EXISTS carrinho(
-                usuario_id INTEGER NOT NULL,
-                produto_id INTEGER NOT NULL,
-                quantidade INTEGER NOT NULL,
-                PRIMARY KEY(usuario_id, produto_id)
+                usuario_id INTEGER NOT NULL, produto_id INTEGER NOT NULL,
+                quantidade INTEGER NOT NULL, PRIMARY KEY(usuario_id, produto_id)
             );
             CREATE TABLE IF NOT EXISTS produtos(
-                id INTEGER PRIMARY KEY,
-                nome TEXT NOT NULL,
-                categoria TEXT,
-                preco REAL NOT NULL,
-                estoque INTEGER NOT NULL
+                id INTEGER PRIMARY KEY, nome TEXT NOT NULL, categoria TEXT,
+                preco REAL NOT NULL, estoque INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS pedidos(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                codigo TEXT NOT NULL UNIQUE,
-                usuario_id INTEGER NOT NULL,
-                subtotal REAL, frete REAL, frete_nome TEXT,
+                id INTEGER PRIMARY KEY AUTOINCREMENT, codigo TEXT NOT NULL UNIQUE,
+                usuario_id INTEGER NOT NULL, subtotal REAL, frete REAL, frete_nome TEXT,
                 desconto_pix REAL, desconto_cupom REAL, cupom TEXT,
                 total REAL, pagamento TEXT,
                 cep TEXT, rua TEXT, numero TEXT, complemento TEXT, cidade TEXT, estado TEXT,
-                status TEXT NOT NULL DEFAULT 'Aguardando pagamento',
-                criado_em TEXT NOT NULL
+                status TEXT NOT NULL DEFAULT 'Aguardando pagamento', criado_em TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS pedido_itens(
-                pedido_id INTEGER NOT NULL,
-                produto_id INTEGER NOT NULL,
+                pedido_id INTEGER NOT NULL, produto_id INTEGER NOT NULL,
                 nome TEXT, preco REAL, quantidade INTEGER
             );
             CREATE TABLE IF NOT EXISTS avaliacoes(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                produto_id INTEGER NOT NULL,
-                usuario_id INTEGER,
-                nome TEXT NOT NULL,
-                nota INTEGER NOT NULL,
-                texto TEXT NOT NULL,
-                data TEXT NOT NULL,
-                criado_em TEXT NOT NULL
+                id INTEGER PRIMARY KEY AUTOINCREMENT, produto_id INTEGER NOT NULL,
+                usuario_id INTEGER, nome TEXT NOT NULL, nota INTEGER NOT NULL,
+                texto TEXT NOT NULL, data TEXT NOT NULL, criado_em TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS cupons(
-                codigo TEXT PRIMARY KEY,
-                tipo TEXT NOT NULL,
-                valor REAL NOT NULL,
-                minimo REAL NOT NULL DEFAULT 0,
-                ativo INTEGER NOT NULL DEFAULT 1
+                codigo TEXT PRIMARY KEY, tipo TEXT NOT NULL, valor REAL NOT NULL,
+                minimo REAL NOT NULL DEFAULT 0, ativo INTEGER NOT NULL DEFAULT 1
             );
         """)
         try:
@@ -542,9 +517,11 @@ def sincronizar_produtos():
         for i, nome, cat, preco, est in prods:
             existe = c.execute("SELECT id FROM produtos WHERE id=?", (i,)).fetchone()
             if existe and os.environ.get("RESETAR_ESTOQUE") == "1":
-                c.execute("UPDATE produtos SET nome=?, categoria=?, preco=?, estoque=? WHERE id=?", (nome, cat, preco, est, i))
+                c.execute("UPDATE produtos SET nome=?, categoria=?, preco=?, estoque=? WHERE id=?",
+                          (nome, cat, preco, est, i))
             elif existe:
-                c.execute("UPDATE produtos SET nome=?, categoria=?, preco=? WHERE id=?", (nome, cat, preco, i))
+                c.execute("UPDATE produtos SET nome=?, categoria=?, preco=? WHERE id=?",
+                          (nome, cat, preco, i))
             else:
                 c.execute("INSERT INTO produtos(id,nome,categoria,preco,estoque) VALUES(?,?,?,?,?)",
                           (i, nome, cat, preco, est))
@@ -573,9 +550,8 @@ def usuario_do_token(c, token):
     if not token:
         return None
     return c.execute(
-        "SELECT u.* FROM sessoes s JOIN usuarios u ON u.id=s.usuario_id WHERE s.token=? AND s.expira_em>?",
-        (token, agora()),
-    ).fetchone()
+        "SELECT u.* FROM sessoes s JOIN usuarios u ON u.id=s.usuario_id "
+        "WHERE s.token=? AND s.expira_em>?", (token, agora())).fetchone()
 
 
 def validar_cupom(c, codigo, subtotal):
@@ -618,6 +594,12 @@ def montar_itens(c, itens):
 def pedido_json(c, p):
     itens = c.execute("SELECT produto_id id, nome, preco, quantidade FROM pedido_itens WHERE pedido_id=?",
                       (p["id"],)).fetchall()
+    out_itens = []
+    for i in itens:
+        try:
+            out_itens.append(dict(i))
+        except Exception:
+            out_itens.append({"id": i[0], "nome": i[1], "preco": i[2], "quantidade": i[3]})
     return {
         "codigo": p["codigo"], "status": p["status"], "criado_em": p["criado_em"],
         "subtotal": p["subtotal"], "frete": p["frete"], "frete_nome": p["frete_nome"],
@@ -625,7 +607,7 @@ def pedido_json(c, p):
         "total": p["total"], "pagamento": p["pagamento"], "codigo_rastreio": p["codigo_rastreio"] or "",
         "endereco": {"cep": p["cep"], "rua": p["rua"], "numero": p["numero"],
                      "complemento": p["complemento"], "cidade": p["cidade"], "estado": p["estado"]},
-        "itens": [dict(i) if isinstance(i, dict) else {"id": i[0], "nome": i[1], "preco": i[2], "quantidade": i[3]} for i in itens],
+        "itens": out_itens,
     }
 
 
@@ -663,13 +645,15 @@ def perfil_json(u):
         end = json.loads(u["endereco_json"] or "{}")
     except Exception:
         end = {}
-    return {"telefone": u["telefone"] or "", "cpf": u["cpf"] or "", "nascimento": u["nascimento"] or "",
-            "endereco": end, "desde": u["criado_em"]}
+    return {"telefone": u["telefone"] or "", "cpf": u["cpf"] or "",
+            "nascimento": u["nascimento"] or "", "endereco": end, "desde": u["criado_em"]}
 
 
 def devolver_estoque(c, pedido_id):
-    for it in c.execute("SELECT produto_id, quantidade FROM pedido_itens WHERE pedido_id=?", (pedido_id,)).fetchall():
-        c.execute("UPDATE produtos SET estoque=estoque+? WHERE id=?", (it["quantidade"], it["produto_id"]))
+    for it in c.execute("SELECT produto_id, quantidade FROM pedido_itens WHERE pedido_id=?",
+                        (pedido_id,)).fetchall():
+        c.execute("UPDATE produtos SET estoque=estoque+? WHERE id=?",
+                  (it["quantidade"], it["produto_id"]))
 
 
 def cancelado(status):
@@ -691,10 +675,8 @@ def rota_api(h, metodo, caminho, corpo):
     auth = h.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
         token = auth[7:].strip()
-
     if rota == "cep" and metodo == "GET" and len(partes) > 1:
         return _cep(partes[1])
-
     with db_lock:
         c = conectar()
         try:
@@ -838,8 +820,10 @@ def _rotas(c, h, metodo, rota, partes, corpo, token):
                 if cep and len(cep) != 8:
                     raise ApiErro("CEP inválido.")
                 end = {"cep": "%s-%s" % (cep[:5], cep[5:]) if cep else "",
-                       "rua": texto(e.get("rua"), 120, False), "numero": texto(e.get("numero"), 15, False),
-                       "cidade": texto(e.get("cidade"), 80, False), "estado": texto(e.get("estado"), 2, False).upper(),
+                       "rua": texto(e.get("rua"), 120, False),
+                       "numero": texto(e.get("numero"), 15, False),
+                       "cidade": texto(e.get("cidade"), 80, False),
+                       "estado": texto(e.get("estado"), 2, False).upper(),
                        "complemento": texto(e.get("complemento"), 80, False)}
                 sets.append("endereco_json=?"); vals.append(json.dumps(end, ensure_ascii=False))
             if sets:
@@ -849,7 +833,13 @@ def _rotas(c, h, metodo, rota, partes, corpo, token):
 
     if rota == "produtos" and metodo == "GET":
         rows = c.execute("SELECT id,nome,categoria,preco,estoque FROM produtos ORDER BY id").fetchall()
-        return 200, {"produtos": [dict(r) if isinstance(r, dict) else dict(zip(("id","nome","categoria","preco","estoque"), r)) for r in rows]}
+        out = []
+        for r in rows:
+            try:
+                out.append(dict(r))
+            except Exception:
+                out.append({"id": r[0], "nome": r[1], "categoria": r[2], "preco": r[3], "estoque": r[4]})
+        return 200, {"produtos": out}
 
     if rota == "favoritos":
         u = exigir_login(c, token)
@@ -859,16 +849,23 @@ def _rotas(c, h, metodo, rota, partes, corpo, token):
         if metodo == "PUT":
             ids = {int(x) for x in corpo.get("favoritos", []) if str(x).lstrip("-").isdigit()}
             c.execute("DELETE FROM favoritos WHERE usuario_id=?", (u["id"],))
-            c.executemany("INSERT INTO favoritos(usuario_id,produto_id) VALUES(?,?)", [(u["id"], i) for i in ids])
+            c.executemany("INSERT INTO favoritos(usuario_id,produto_id) VALUES(?,?)",
+                          [(u["id"], i) for i in ids])
             return 200, {"favoritos": sorted(ids)}
 
     if rota == "carrinho":
         u = exigir_login(c, token)
         if metodo == "GET":
             rows = c.execute(
-                "SELECT p.id, p.nome, p.preco, k.quantidade FROM carrinho k JOIN produtos p ON p.id=k.produto_id "
-                "WHERE k.usuario_id=?", (u["id"],)).fetchall()
-            return 200, {"carrinho": [dict(r) if isinstance(r, dict) else {"id": r[0], "nome": r[1], "preco": r[2], "quantidade": r[3]} for r in rows]}
+                "SELECT p.id, p.nome, p.preco, k.quantidade FROM carrinho k "
+                "JOIN produtos p ON p.id=k.produto_id WHERE k.usuario_id=?", (u["id"],)).fetchall()
+            out = []
+            for r in rows:
+                try:
+                    out.append(dict(r))
+                except Exception:
+                    out.append({"id": r[0], "nome": r[1], "preco": r[2], "quantidade": r[3]})
+            return 200, {"carrinho": out}
         if metodo == "PUT":
             c.execute("DELETE FROM carrinho WHERE usuario_id=?", (u["id"],))
             for it in corpo.get("carrinho", []):
@@ -945,12 +942,14 @@ def _rotas(c, h, metodo, rota, partes, corpo, token):
                 "total,pagamento,cep,rua,numero,complemento,cidade,estado,criado_em,custo_frete_loja) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (codigo, u["id"], subtotal, frete_valor, frete_nome, pix, desc_cupom,
-                 cupom_cod, total, pag, "%s-%s" % (cep[:5], cep[5:]), rua, numero, comp, cidade, estado, agora(), custo_loja))
+                 cupom_cod, total, pag, "%s-%s" % (cep[:5], cep[5:]), rua, numero, comp,
+                 cidade, estado, agora(), custo_loja))
             pid = cur.lastrowid
             for it in lista:
                 c.execute("INSERT INTO pedido_itens VALUES(?,?,?,?,?)",
                           (pid, it["id"], it["nome"], it["preco"], it["quantidade"]))
-                c.execute("UPDATE produtos SET estoque=estoque-? WHERE id=?", (it["quantidade"], it["id"]))
+                c.execute("UPDATE produtos SET estoque=estoque-? WHERE id=?",
+                          (it["quantidade"], it["id"]))
             c.execute("DELETE FROM carrinho WHERE usuario_id=?", (u["id"],))
             p = c.execute("SELECT * FROM pedidos WHERE id=?", (pid,)).fetchone()
             return 201, {"pedido": pedido_json(c, p)}
@@ -958,9 +957,15 @@ def _rotas(c, h, metodo, rota, partes, corpo, token):
     if rota == "avaliacoes" and len(partes) > 1 and partes[1].isdigit():
         pid = int(partes[1])
         if metodo == "GET":
-            rows = c.execute("SELECT nome n, data d, nota s, texto t FROM avaliacoes WHERE produto_id=? "
-                             "ORDER BY id DESC", (pid,)).fetchall()
-            return 200, {"avaliacoes": [dict(r) if isinstance(r, dict) else {"n": r[0], "d": r[1], "s": r[2], "t": r[3]} for r in rows]}
+            rows = c.execute("SELECT nome n, data d, nota s, texto t FROM avaliacoes "
+                             "WHERE produto_id=? ORDER BY id DESC", (pid,)).fetchall()
+            out = []
+            for r in rows:
+                try:
+                    out.append(dict(r))
+                except Exception:
+                    out.append({"n": r[0], "d": r[1], "s": r[2], "t": r[3]})
+            return 200, {"avaliacoes": out}
         if metodo == "POST":
             if not c.execute("SELECT 1 FROM produtos WHERE id=?", (pid,)).fetchone():
                 raise ApiErro("Produto não existe.", 404)
@@ -973,21 +978,21 @@ def _rotas(c, h, metodo, rota, partes, corpo, token):
                 nota = 5
             nota = max(1, min(5, nota))
             c.execute("INSERT INTO avaliacoes(produto_id,usuario_id,nome,nota,texto,data,criado_em) "
-                      "VALUES(?,?,?,?,?,?,?)", (pid, u["id"] if u else None, nome, nota, txt, data_br(), agora()))
+                      "VALUES(?,?,?,?,?,?,?)",
+                      (pid, u["id"] if u else None, nome, nota, txt, data_br(), agora()))
             return 201, {"avaliacao": {"n": nome, "d": data_br(), "s": nota, "t": txt}}
 
     if rota == "admin":
         exigir_admin(h)
         sub = partes[1] if len(partes) > 1 else ""
         if sub == "pedidos" and metodo == "GET":
-            rows = c.execute("SELECT p.*, u.nome cliente, u.email FROM pedidos p JOIN usuarios u ON u.id=p.usuario_id "
-                             "ORDER BY p.id DESC").fetchall()
+            rows = c.execute("SELECT p.*, u.nome cliente, u.email FROM pedidos p "
+                             "JOIN usuarios u ON u.id=p.usuario_id ORDER BY p.id DESC").fetchall()
             out = []
             for p in rows:
                 j = pedido_json(c, p)
                 try:
-                    j["cliente"] = p["cliente"]
-                    j["email"] = p["email"]
+                    j["cliente"], j["email"] = p["cliente"], p["email"]
                 except Exception:
                     pass
                 out.append(j)
@@ -997,38 +1002,55 @@ def _rotas(c, h, metodo, rota, partes, corpo, token):
             if not ped:
                 raise ApiErro("Pedido não encontrado.", 404)
             status = texto(corpo.get("status") or ped["status"], 40, nome="status")
-            rastreio = texto(corpo.get("rastreio"), 40, obrigatorio=False) if "rastreio" in corpo else ped["codigo_rastreio"]
+            rastreio = (texto(corpo.get("rastreio"), 40, obrigatorio=False)
+                        if "rastreio" in corpo else ped["codigo_rastreio"])
             if cancelado(status) and not cancelado(ped["status"]):
                 devolver_estoque(c, ped["id"])
-            c.execute("UPDATE pedidos SET status=?, codigo_rastreio=? WHERE id=?", (status, rastreio, ped["id"]))
+            c.execute("UPDATE pedidos SET status=?, codigo_rastreio=? WHERE id=?",
+                      (status, rastreio, ped["id"]))
             return 200, {"ok": True}
         if sub == "estoque" and metodo == "PUT" and len(partes) > 2 and partes[2].isdigit():
             try:
                 novo = max(0, int(corpo.get("estoque", 0)))
             except (TypeError, ValueError):
                 raise ApiErro("Estoque inválido.")
-            n = c.execute("UPDATE produtos SET estoque=? WHERE id=?", (novo, int(partes[2]))).rowcount
+            n = c.execute("UPDATE produtos SET estoque=? WHERE id=?",
+                          (novo, int(partes[2]))).rowcount
             if not n:
                 raise ApiErro("Produto não encontrado.", 404)
             return 200, {"ok": True}
         if sub == "cupons" and metodo == "GET":
             rows = c.execute("SELECT * FROM cupons").fetchall()
-            return 200, {"cupons": [dict(r) if isinstance(r, dict) else {"codigo": r[0], "tipo": r[1], "valor": r[2], "minimo": r[3], "ativo": r[4]} for r in rows]}
+            out = []
+            for r in rows:
+                try:
+                    out.append(dict(r))
+                except Exception:
+                    out.append({"codigo": r[0], "tipo": r[1], "valor": r[2],
+                                "minimo": r[3], "ativo": r[4]})
+            return 200, {"cupons": out}
         if sub == "cupons" and metodo == "POST":
             cod = texto(corpo.get("codigo"), 30, nome="código").upper()
             tipo = corpo.get("tipo") if corpo.get("tipo") in ("percentual", "fixo") else "percentual"
             c.execute("INSERT OR REPLACE INTO cupons(codigo,tipo,valor,minimo,ativo) VALUES(?,?,?,?,?)",
-                      (cod, tipo, float(corpo.get("valor", 0)), float(corpo.get("minimo", 0)),
-                       1 if corpo.get("ativo", True) else 0))
+                      (cod, tipo, float(corpo.get("valor", 0)),
+                       float(corpo.get("minimo", 0)), 1 if corpo.get("ativo", True) else 0))
             return 201, {"ok": True}
         if sub == "usuarios" and metodo == "GET":
             rows = c.execute("SELECT id,nome,email,criado_em FROM usuarios ORDER BY id DESC").fetchall()
-            return 200, {"usuarios": [dict(r) if isinstance(r, dict) else {"id": r[0], "nome": r[1], "email": r[2], "criado_em": r[3]} for r in rows]}
+            out = []
+            for r in rows:
+                try:
+                    out.append(dict(r))
+                except Exception:
+                    out.append({"id": r[0], "nome": r[1], "email": r[2], "criado_em": r[3]})
+            return 200, {"usuarios": out}
 
     raise ApiErro("Rota não encontrada.", 404)
 
 
-EXT_PERMITIDAS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg", ".ico", ".avif", ".jfif", ".css", ".js", ".woff", ".woff2"}
+EXT_PERMITIDAS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg", ".ico",
+                  ".avif", ".jfif", ".css", ".js", ".woff", ".woff2"}
 PASTAS_BUSCA = ("static/images", "images", "static/img", "img", "static", "assets", ".")
 EXT_IMAGEM = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg", ".ico", ".avif", ".jfif"}
 
@@ -1064,7 +1086,7 @@ def avisar_logos_faltando():
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "PoderosaServer/3.0"
+    server_version = "PoderosaServer/4.0"
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[%s] %s\n" % (datetime.now().strftime("%H:%M:%S"), fmt % args))
@@ -1186,10 +1208,6 @@ def main():
     if USANDO_TURSO:
         print(" Banco: TURSO (nuvem) -> %s" % TURSO_URL)
         print("        Dados salvos na nuvem, nunca perde.")
-    elif TURSO_URL and TURSO_TOKEN and not TURSO_BIBLIOTECA_OK:
-        print(" Banco: SQLite local (%s) - ATENCAO!" % DB_PATH)
-        print("        Token do Turso existe, mas a biblioteca nao esta instalada.")
-        print("        Rode: pip install libsql")
     else:
         print(" Banco: SQLite local -> %s" % DB_PATH)
     print(" CEP de origem (frete): %s" % CEP_ORIGEM)
