@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+pow.db
+.admin_token
